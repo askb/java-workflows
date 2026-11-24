@@ -96,9 +96,10 @@ describes what the project publishes without a second resolution. The
 merge keeps one root, each module once and every module's dependency
 graph, so the Grype gate still tells direct from transitive. It needs
 a successful build, since a failed one may stop partway, and fails
-when no module wrote a BOM or the BOMs mix CycloneDX schema versions;
-it skips any BOM inside a `target` tree. The POM and environment
-guards below apply under either source.
+when no module wrote a BOM or the BOMs mix CycloneDX schema versions.
+It reads every module in the workspace, so modules a reactor names
+beside `path_prefix` count, and skips any BOM inside a `target` tree.
+The POM and environment guards below apply under either source.
 
 The per-step timeout inputs (`tests_timeout_minutes`,
 `sbom_timeout_minutes`, `cbom_timeout_minutes`) each bound their own

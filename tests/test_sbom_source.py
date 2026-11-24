@@ -124,7 +124,7 @@ class SbomMerge(ContractCase):
         script = run_of(load_workflow(MAVEN), "build", MERGE_STEP)
         return run_script(
             script,
-            {"PATH_PREFIX": "", "REPOSITORY": REPOSITORY},
+            {"REPOSITORY": REPOSITORY},
             cwd=top,
         )
 
@@ -182,6 +182,27 @@ class SbomMerge(ContractCase):
             self.assert_passes(verdict, "stray BOMs are skipped")
             self.assertNotIn("sample", verdict.log)
             self.assertNotIn("docs", verdict.log)
+
+    def test_takes_modules_beside_the_path_prefix(self) -> None:
+        """A module the reactor names outside path_prefix is merged."""
+        with tempfile.TemporaryDirectory() as scratch:
+            top = Path(scratch)
+            place(top, "reactor", module_bom(API, [], {API: []}))
+            place(top, "outside", module_bom(IMPL, [], {IMPL: [API]}))
+
+            verdict = self.merge(top)
+
+            self.assert_passes(verdict, "a sibling of path_prefix")
+            refs = [c["bom-ref"] for c in self.merged(top)["components"]]
+            self.assertEqual(sorted(refs), sorted([API, IMPL]))
+
+    def test_names_the_repository_it_scans(self) -> None:
+        """The root names the repository the lane checks out."""
+        step = step_of(job_of(load_workflow(MAVEN), "build"), MERGE_STEP)
+        self.assertEqual(
+            text(section(step, "env").get("REPOSITORY")),
+            "${{ inputs.repository || github.repository }}",
+        )
 
     def test_fails_without_a_module_bom(self) -> None:
         """A build that wrote no module BOM leaves nothing to scan."""

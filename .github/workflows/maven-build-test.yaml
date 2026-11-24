@@ -1373,8 +1373,12 @@ jobs:
       # sibling depends on is scoped in the sibling's BOM; its own
       # unscoped entry wins, as in the aggregate. Only a successful
       # build counts, since a failed one stops partway and a partial
-      # reactor would pass for the whole. A target tree is build
-      # output, never a module, and can hold other projects' BOMs.
+      # reactor would pass for the whole. The walk covers the whole
+      # workspace, not path_prefix alone, since a reactor may name
+      # modules beside it ('../core'); a fresh checkout holds no
+      # target/bom.json the build did not write. A target tree is
+      # build output, never a module, and can hold other projects'
+      # BOMs.
       - name: 'Merge the build SBOMs'
         id: sbom-merge
         # yamllint disable-line rule:line-length
@@ -1382,8 +1386,7 @@ jobs:
         timeout-minutes: ${{ inputs.sbom_timeout_minutes }}
         shell: bash
         env:
-          PATH_PREFIX: ${{ inputs.path_prefix }}
-          REPOSITORY: ${{ github.repository }}
+          REPOSITORY: ${{ inputs.repository || github.repository }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1438,11 +1441,11 @@ jobs:
               return doc
 
 
-          paths = module_boms(os.environ["PATH_PREFIX"] or ".")
+          paths = module_boms(".")
           if not paths:
               fail(
                   "sbom_source 'build' found no target/bom.json beside a"
-                  " pom.xml under path_prefix: the build must run"
+                  " pom.xml in the workspace: the build must run"
                   " cyclonedx-maven-plugin makeBom in each module."
               )
           docs = [load(path) for path in paths]
