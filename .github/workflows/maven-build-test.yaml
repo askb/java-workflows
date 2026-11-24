@@ -164,6 +164,16 @@ on:
         required: false
         type: boolean
         default: true
+      sbom_source:
+        description: >-
+          Where the SBOM comes from. 'generate' resolves the graph
+          again with sbom-action (makeAggregateBom). 'build' merges
+          the target/bom.json that cyclonedx-maven-plugin makeBom
+          wrote into each module during the build, for a parent that
+          binds that goal; the build must succeed and reach it.
+        required: false
+        type: string
+        default: 'generate'
 
       # --- Grype scan ---
       grype_enabled:
@@ -575,6 +585,20 @@ jobs:
               "to 64 letters, digits, '.', '_' or '-'."
             exit 1
           fi
+      # Each SBOM path tests for its own value, so any other would skip
+      # both, and the Grype job would quietly have nothing to scan.
+      - name: 'Validate sbom_source'
+        shell: bash
+        env:
+          SBOM_SOURCE: ${{ inputs.sbom_source }}
+        run: |
+          set -euo pipefail
+          case "${SBOM_SOURCE}" in
+            generate | build) ;;
+            *)
+              echo "::error::sbom_source must be 'generate' or 'build'."
+              exit 1 ;;
+          esac
       # grype-scan-action checks these inputs itself, but only once the
       # build has run. Its validate-only mode runs the same checks on
       # the same code and nothing else: no scan, no network request,
@@ -772,7 +796,7 @@ jobs:
       coverage: ${{ steps.build.outputs.coverage }}
       branch_coverage: ${{ steps.build.outputs.branch_coverage }}
       # Read by the Grype job, which runs whenever an SBOM was uploaded,
-      # including after a test failure.
+      # including, under sbom_source 'generate', after a test failure.
       sbom_uploaded: ${{ steps.upload-sbom.outcome == 'success' }}
       # The ID that upload returned, so the Grype job fetches that
       # artefact and no other of the same name.
@@ -1249,10 +1273,12 @@ jobs:
       # drops the implicit success() gate, so require both SBOM guards
       # by name: the steps below chain on this one, and a POM or
       # environment the guards rejected would describe another graph.
+      # Only sbom_source 'generate' resolves anything; skipping this
+      # step skips the generation that chains on it.
       - name: 'Install Maven global settings'
         id: settings
         # yamllint disable-line rule:line-length
-        if: ${{ !cancelled() && inputs.sbom_enabled && steps.pom-guard.outcome == 'success' && steps.env-guard.outcome == 'success' }}
+        if: ${{ !cancelled() && inputs.sbom_enabled && inputs.sbom_source == 'generate' && steps.pom-guard.outcome == 'success' && steps.env-guard.outcome == 'success' }}
         shell: bash
         env:
           GLOBAL_SETTINGS: ${{ secrets.maven_global_settings }}
@@ -1333,9 +1359,173 @@ jobs:
           SETTINGS_FILE: ${{ steps.settings.outputs.path }}
         run: rm -f -- "${SETTINGS_FILE}"
 
+      # sbom_source 'build': a parent binding cyclonedx-maven-plugin
+      # makeBom (odlparent does) leaves target/bom.json in each module
+      # it would deploy, from the graph that module resolved. Merged,
+      # they describe what the project publishes with no second
+      # resolution; makeAggregateBom, by contrast, skips the whole
+      # reactor when its root sets maven.deploy.skip.
+      #
+      # The merge keeps the makeAggregateBom shape grype-scan-action
+      # reads the dependency graph from: one root with an empty
+      # dependsOn, each module unscoped, each third-party component
+      # once and scoped, and every module's edges. A module that a
+      # sibling depends on is scoped in the sibling's BOM; its own
+      # unscoped entry wins, as in the aggregate. Only a successful
+      # build counts, since a failed one stops partway and a partial
+      # reactor would pass for the whole. A target tree is build
+      # output, never a module, and can hold other projects' BOMs.
+      - name: 'Merge the build SBOMs'
+        id: sbom-merge
+        # yamllint disable-line rule:line-length
+        if: ${{ !cancelled() && inputs.sbom_enabled && inputs.sbom_source == 'build' && steps.build.outcome == 'success' }}
+        timeout-minutes: ${{ inputs.sbom_timeout_minutes }}
+        shell: bash
+        env:
+          PATH_PREFIX: ${{ inputs.path_prefix }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import uuid
+          from datetime import datetime, timezone
+
+
+          def shown(value):
+              """Escape workflow-command metacharacters, % first."""
+              for raw, escaped in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A")):
+                  value = value.replace(raw, escaped)
+              return value
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def module_boms(top):
+              found = []
+              for path, dirs, files in os.walk(top):
+                  skipped = ("target", ".git")
+                  dirs[:] = sorted(d for d in dirs if d not in skipped)
+                  bom = os.path.join(path, "target", "bom.json")
+                  if "pom.xml" in files and os.path.isfile(bom):
+                      found.append(os.path.normpath(bom))
+              return found
+
+
+          def load(path):
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      doc = json.load(handle)
+              except (OSError, ValueError):
+                  fail(f"{shown(path)} is not a readable JSON document.")
+              if not isinstance(doc, dict):
+                  doc = {}
+              if doc.get("bomFormat") != "CycloneDX":
+                  fail(f"{shown(path)} is not a CycloneDX document.")
+              metadata = doc.get("metadata")
+              if not isinstance(metadata, dict):
+                  metadata = {}
+              root = metadata.get("component")
+              if not isinstance(root, dict):
+                  root = {}
+              if not isinstance(root.get("bom-ref"), str):
+                  fail(f"{shown(path)} does not name its own module.")
+              return doc
+
+
+          paths = module_boms(os.environ["PATH_PREFIX"] or ".")
+          if not paths:
+              fail(
+                  "sbom_source 'build' found no target/bom.json beside a"
+                  " pom.xml under path_prefix: the build must run"
+                  " cyclonedx-maven-plugin makeBom in each module."
+              )
+          docs = [load(path) for path in paths]
+          specs = sorted({str(doc.get("specVersion")) for doc in docs})
+          if len(specs) != 1:
+              fail(
+                  "The module BOMs mix CycloneDX schemas "
+                  f"{shown(', '.join(specs))}; use one plugin version."
+              )
+
+          modules = {}
+          for doc in docs:
+              module = dict(doc["metadata"]["component"])
+              module.pop("scope", None)
+              modules.setdefault(module["bom-ref"], module)
+          third_party = {}
+          edges = {}
+          for doc in docs:
+              for component in doc.get("components") or []:
+                  if not isinstance(component, dict):
+                      continue
+                  ref = component.get("bom-ref")
+                  key = ref if isinstance(ref, str) else json.dumps(component)
+                  if key not in modules:
+                      third_party.setdefault(key, component)
+              for entry in doc.get("dependencies") or []:
+                  if not isinstance(entry, dict):
+                      continue
+                  if isinstance(entry.get("ref"), str):
+                      targets = edges.setdefault(entry["ref"], {})
+                      for target in entry.get("dependsOn") or []:
+                          if isinstance(target, str):
+                              targets[target] = None
+
+          # A purl cannot start 'reactor:', so the root names no module.
+          repository = os.environ["REPOSITORY"] or "reactor"
+          root = f"reactor:{repository}"
+          merged = {
+              "bomFormat": "CycloneDX",
+              "specVersion": specs[0],
+              "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+              "version": 1,
+              "metadata": {
+                  "timestamp": datetime.now(timezone.utc).strftime(
+                      "%Y-%m-%dT%H:%M:%SZ"
+                  ),
+                  "tools": docs[0]["metadata"].get("tools", []),
+                  "component": {
+                      "type": "application",
+                      "bom-ref": root,
+                      "name": repository,
+                  },
+              },
+              "components": [*modules.values(), *third_party.values()],
+              "dependencies": [
+                  {"ref": root, "dependsOn": []},
+                  *(
+                      {"ref": ref, "dependsOn": list(on)}
+                      for ref, on in edges.items()
+                  ),
+              ],
+          }
+          with open("sbom-cyclonedx.json", "w", encoding="utf-8") as handle:
+              json.dump(merged, handle, indent=2)
+              handle.write("\n")
+
+          for path in paths:
+              print(f"Merged {shown(path)}")
+          line = (
+              f"SBOM: merged {len(paths)} module BOMs, {len(modules)} modules"
+              f" and {len(third_party)} other components."
+          )
+          print(line)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(f"{line}\n")
+          PY
+
       - name: 'Upload SBOM artifacts'
         id: upload-sbom
-        if: ${{ !cancelled() && steps.sbom.outcome == 'success' }}
+        # yamllint disable-line rule:line-length
+        if: ${{ !cancelled() && (steps.sbom.outcome == 'success' || steps.sbom-merge.outcome == 'success') }}
         # yamllint disable-line rule:line-length
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:

@@ -134,7 +134,6 @@ class SbomMerge(ContractCase):
         document: dict[str, Any] = json.loads(path.read_text("utf-8"))
         return document
 
-    @unittest.expectedFailure
     def test_merges_the_modules_into_one_graph(self) -> None:
         """Each module once and unscoped, each library once, edges joined."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -164,7 +163,6 @@ class SbomMerge(ContractCase):
             self.assertEqual(edges[IMPL], [API, NETTY])
             self.assertEqual(edges[API], [GUAVA])
 
-    @unittest.expectedFailure
     def test_ignores_boms_outside_the_modules(self) -> None:
         """A BOM in a target tree or beside no pom.xml is not a module."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -185,7 +183,6 @@ class SbomMerge(ContractCase):
             self.assertNotIn("sample", verdict.log)
             self.assertNotIn("docs", verdict.log)
 
-    @unittest.expectedFailure
     def test_fails_without_a_module_bom(self) -> None:
         """A build that wrote no module BOM leaves nothing to scan."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -198,7 +195,6 @@ class SbomMerge(ContractCase):
             self.assertIn("::error::", verdict.log)
             self.assertFalse((top / "sbom-cyclonedx.json").exists())
 
-    @unittest.expectedFailure
     def test_fails_on_mixed_schemas(self) -> None:
         """Module BOMs of two specVersions do not merge into one."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -210,7 +206,6 @@ class SbomMerge(ContractCase):
 
             self.assert_fails(verdict, "1.4 beside 1.6")
 
-    @unittest.expectedFailure
     def test_fails_on_a_document_that_is_not_cyclonedx(self) -> None:
         """A module's target/bom.json that is not CycloneDX fails."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -236,7 +231,6 @@ class SbomSourceWiring(ContractCase):
         build = job_of(load_workflow(MAVEN), "build")
         return text(step_of(build, name).get("if"))
 
-    @unittest.expectedFailure
     def test_defaults_to_generate(self) -> None:
         """Without sbom_source the lane generates its SBOM as before."""
         workflow = load_workflow(MAVEN)
@@ -246,7 +240,6 @@ class SbomSourceWiring(ContractCase):
         default = section(inputs, "sbom_source").get("default")
         self.assertEqual(text(default), "generate")
 
-    @unittest.expectedFailure
     def test_validation_takes_the_two_sources_alone(self) -> None:
         """'generate' and 'build' pass; any other value fails."""
         for value in ("generate", "build"):
@@ -254,7 +247,6 @@ class SbomSourceWiring(ContractCase):
         for value in ("", "Build", "both", "build\n::warning::x"):
             self.assert_fails(self.validate(value), f"sbom_source {value!r}")
 
-    @unittest.expectedFailure
     def test_each_source_runs_its_own_steps(self) -> None:
         """Settings run under 'generate'; the merge under 'build' alone."""
         settings = self.condition(SETTINGS_STEP)
@@ -264,7 +256,6 @@ class SbomSourceWiring(ContractCase):
         self.assertIn("inputs.sbom_enabled", merge)
         self.assertIn("steps.build.outcome == 'success'", merge)
 
-    @unittest.expectedFailure
     def test_the_upload_takes_either_sbom(self) -> None:
         """The upload runs after a generated or a merged SBOM."""
         upload = self.condition(UPLOAD_STEP)
