@@ -17,7 +17,8 @@ dependency files, so these tests hold it in place:
   that one action and nothing else; the verify lanes'
   grype_dependency_ecosystems check accepts each allowed value and
   rejects a typo, run as extracted from the workflows;
-- every repository-metadata-action call is at the v0.5.4 pin, and no
+- every repository-metadata-action call shares one full commit SHA
+  pin with a version comment no older than the floor, and no
   workflow calls dependency-change-action directly, reads its
   sidecar, or keeps a dependency-change job;
 - each verify lane's repository-metadata job detects with its own
@@ -98,11 +99,21 @@ from yaml_loading import ROOT, read_text
 LANES = (MAVEN, GRADLE)
 PRESETS = {MAVEN: "maven", GRADLE: "gradle"}
 
-META_PIN = "ff822d06a64404a54feb79f8e27b687cc76d1c83"
 META_ACTION = "lfreleng-actions/repository-metadata-action"
-META_USES = f"{META_ACTION}@{META_PIN}"
-# The pin with its version comment, as the workflow text must hold it.
-META_LINE = f"uses: {META_USES}  # v0.5.4"
+# The oldest release the workflows may pin. v0.5.4 is the release the
+# lanes' dependency_* detection inputs were verified against; an older
+# one may not take them. The tests name no exact pin, so a Dependabot
+# bump that moves every call to one newer release passes untouched.
+META_FLOOR = (0, 5, 4)
+# The files that call the action, each once, all at one pin.
+META_FILES = (*LANES, MERGE, TESTING)
+# A reference to the action: its ref, then the rest of the line.
+META_REFERENCE = re.compile(
+    rf"{re.escape(META_ACTION)}@(\S*)(.*)$", re.MULTILINE
+)
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+# The version comment a pin carries, as Dependabot writes it.
+VERSION_COMMENT = re.compile(r"  # v(\d+)\.(\d+)\.(\d+)")
 # The detector the lanes called before repository-metadata-action took
 # detection over; no workflow may call it, or read its sidecar, now.
 OLD_DETECTOR = "lfreleng-actions/dependency-change-action@"
@@ -302,6 +313,21 @@ ECOSYSTEM_FAILS = (
 )
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+
+
+def meta_pins(source: str) -> list[tuple[str, str]]:
+    """Return the ref and rest of the line of each call to the action."""
+    return [(match[1], match[2]) for match in META_REFERENCE.finditer(source)]
+
+
+def lanes_meta_uses() -> str:
+    """Return the uses: value at the lanes' repository-metadata pin.
+
+    Read from the Maven lane; MetadataDetection holds every file that
+    calls the action to that one pin.
+    """
+    pins = meta_pins(read_text(MAVEN))
+    return f"{META_ACTION}@{pins[0][0]}" if pins else ""
 
 
 def mutated(workflow: Workflow) -> Workflow:
@@ -1012,29 +1038,63 @@ class GateValidateCheck(ContractCase):
 class MetadataDetection(ContractCase):
     """Detection in the repository-metadata job: pin, inputs and output."""
 
-    def check_pin_in_text(self, path: str, count: int = 1) -> None:
-        """Fail unless the file calls the action at the pin, comment and all.
+    def check_pins(self, paths: tuple[str, ...]) -> None:
+        """Fail unless the files call the action once each, at one pin.
 
-        Every call is at the pin, so the repository holds one.
+        The pin is a full commit SHA carrying a '# vX.Y.Z' comment that
+        names a release no older than META_FLOOR, the same in every file.
         """
-        source = read_text(path)
+        seen: set[tuple[str, str]] = set()
+        for path in paths:
+            pins = meta_pins(read_text(path))
+            self.assertEqual(
+                len(pins), 1, f"{path}: {META_ACTION} must be called once"
+            )
+            for ref, comment in pins:
+                call = f"{path}: {META_ACTION}@{ref}"
+                self.assertIsNotNone(
+                    FULL_SHA.fullmatch(ref),
+                    f"{call} is not pinned to a full commit SHA",
+                )
+                version = VERSION_COMMENT.fullmatch(comment)
+                if version is None:
+                    self.fail(f"{call} lacks its '  # vX.Y.Z' comment")
+                release = tuple(int(part) for part in version.groups())
+                self.assertGreaterEqual(
+                    release,
+                    META_FLOOR,
+                    f"{call} names{comment[3:]}, older than the floor",
+                )
+                seen.add((ref, comment))
         self.assertEqual(
-            source.count(META_LINE),
-            count,
-            f"{path}: {META_LINE} must appear {count} time(s)",
+            len(seen),
+            1,
+            f"every {META_ACTION} call must share one pin: {sorted(seen)}",
         )
-        self.assertEqual(
-            source.count(f"{META_ACTION}@"),
-            count,
-            f"{path}: every repository-metadata-action call must be at"
-            f" {META_PIN}",
-        )
+
+    def check_repinned(self, pins: dict[str, str]) -> None:
+        """Run check_pins with each named file's pin and comment replaced.
+
+        ``pins`` maps a file to the text that follows '@' in its call.
+        """
+        ref, comment = meta_pins(read_text(MAVEN))[0]
+        current = f"@{ref}{comment}"
+        sources = {path: read_text(path) for path in META_FILES}
+        for path, pin in pins.items():
+            self.assertIn(current, sources[path], f"{path} lost its pin")
+            sources[path] = sources[path].replace(current, f"@{pin}")
+        with mock.patch(
+            f"{__name__}.read_text", side_effect=sources.__getitem__
+        ):
+            self.check_pins(META_FILES)
 
     def check_step(self, workflow: Workflow, preset: str) -> None:
         """Fail unless the metadata step detects with the lane's inputs."""
         step = step_of(job_of(workflow, META_JOB), META_STEP)
         self.assertEqual(text(step.get("id")), META_STEP_ID, "step id")
-        self.assertEqual(uses_of(step), META_USES, f"'{META_STEP}' uses")
+        self.assertEqual(
+            uses_of(step), lanes_meta_uses(), f"'{META_STEP}' uses"
+        )
         passed = with_of(step)
         want = {
             # Only when a scan can consume it: without the SBOM no Grype
@@ -1119,10 +1179,17 @@ class MetadataDetection(ContractCase):
         )
 
     def test_the_pin_appears_once_with_its_comment(self) -> None:
-        """Each workflow calling the action holds the v0.5.4 pin, once."""
-        for path in (*LANES, MERGE, TESTING):
-            with self.subTest(path=path):
-                self.check_pin_in_text(path)
+        """Each workflow calls the action once, all at one valid pin."""
+        self.check_pins(META_FILES)
+
+    def test_a_bump_of_every_call_passes(self) -> None:
+        """Every call moved to one newer release passes the check."""
+        self.check_repinned(dict.fromkeys(META_FILES, f"{'1' * 40}  # v0.6.0"))
+
+    def test_the_floor_itself_passes(self) -> None:
+        """Every call at the floor release passes the check."""
+        floor = "ff822d06a64404a54feb79f8e27b687cc76d1c83  # v0.5.4"
+        self.check_repinned(dict.fromkeys(META_FILES, floor))
 
     def test_the_step_detects_with_the_lanes_inputs(self) -> None:
         """Each lane's metadata step detects with the lane's inputs."""
@@ -1158,14 +1225,34 @@ class MetadataDetection(ContractCase):
         """A second call at another pin fails the check."""
         source = read_text(MAVEN) + f"\n# uses: {META_ACTION}@{'0' * 40}\n"
         with mock.patch(f"{__name__}.read_text", return_value=source):
-            self.assert_check_fails(self.check_pin_in_text, MAVEN)
+            self.assert_check_fails(self.check_pins, (MAVEN,))
+
+    def test_one_file_at_another_pin_fails(self) -> None:
+        """One file at a pin the others do not share fails the check."""
+        pins = {GRADLE: f"{'1' * 40}  # v0.6.0"}
+        self.assert_check_fails(self.check_repinned, pins)
 
     def test_the_old_pin_fails(self) -> None:
-        """The metadata step at v0.3.3 fails the check."""
+        """Every call at v0.3.3, below the floor, fails the check."""
         old = "2206d754f65f1a90f57b49be546712c5f594def2  # v0.3.3"
-        source = read_text(GRADLE).replace(f"{META_PIN}  # v0.5.4", old)
-        with mock.patch(f"{__name__}.read_text", return_value=source):
-            self.assert_check_fails(self.check_pin_in_text, GRADLE)
+        self.assert_check_fails(
+            self.check_repinned, dict.fromkeys(META_FILES, old)
+        )
+
+    def test_a_pin_without_its_comment_fails(self) -> None:
+        """Every call at a SHA with no version comment fails the check."""
+        self.assert_check_fails(
+            self.check_repinned, dict.fromkeys(META_FILES, "1" * 40)
+        )
+
+    def test_a_tag_or_short_ref_fails(self) -> None:
+        """Every call at a tag, branch or short SHA fails the check."""
+        for ref in ("v0.6.0", "main", "1" * 7):
+            with self.subTest(ref=ref):
+                self.assert_check_fails(
+                    self.check_repinned,
+                    dict.fromkeys(META_FILES, f"{ref}  # v0.6.0"),
+                )
 
     def test_detection_left_on_fails(self) -> None:
         """Detection on whatever the policy says fails the check."""
@@ -1923,7 +2010,7 @@ class GateVerdictCases(ContractCase):
         step = step_of(job_of(testing, CASES_JOB), DETECT_STEP)
         passed = with_of(step)
         want = {
-            "uses": META_USES,
+            "uses": lanes_meta_uses(),
             "id": META_STEP_ID,
             "dependency_change": "true",
             # Every preset, or the matrix's narrowed selection prefixed
@@ -2024,11 +2111,10 @@ class GateVerdictCases(ContractCase):
         self.check_needs(load_workflow(TESTING))
 
     def test_the_detector_pin_appears_in_the_text(self) -> None:
-        """testing.yaml holds the pinned uses: line with its comment."""
+        """testing.yaml calls the action at the lanes' pin."""
+        line = f"uses: {lanes_meta_uses()}  # v"
         self.assertIn(
-            META_LINE,
-            read_text(TESTING),
-            f"{TESTING}: no step runs {META_LINE}",
+            line, read_text(TESTING), f"{TESTING}: no step runs {line}"
         )
 
     def test_the_detector(self) -> None:
