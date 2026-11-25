@@ -13,16 +13,20 @@ the wiring that chooses between the two sources:
 - the generate path, from the settings step on, runs only under
   'generate', and the merge only under 'build' after a successful
   build;
-- the upload takes whichever SBOM the run produced;
+- the upload takes whichever SBOM the run produced, and the merge's
+  JSON alone under 'build';
 - the merge keeps one root with no edges of its own, each module once
-  and unscoped, each other component once, and every module's edges;
-  it ignores a BOM in a target tree or outside a module, and fails on
-  none or on a mix of schemas.
+  and unscoped (whatever type a sibling names it by), each other
+  component once at its strongest scope, and every module's edges;
+  it ignores a BOM in a target tree, outside a module or tracked by
+  the repository, and fails on none, on a BOM without a schema
+  version or on a mix of schemas.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -163,6 +167,96 @@ class SbomMerge(ContractCase):
             self.assertEqual(edges[IMPL], [API, NETTY])
             self.assertEqual(edges[API], [GUAVA])
 
+    def test_a_bundle_module_stays_one_module(self) -> None:
+        """A sibling's ?type=jar names the ?type=bundle module once."""
+        with tempfile.TemporaryDirectory() as scratch:
+            top = Path(scratch)
+            jar = API
+            bundle = API.replace("type=jar", "type=bundle")
+            place(top, "api", module_bom(bundle, [library(GUAVA)], {}))
+            place(
+                top,
+                "impl",
+                module_bom(
+                    IMPL,
+                    [library(jar), library(GUAVA)],
+                    {IMPL: [jar], jar: [GUAVA], GUAVA: []},
+                ),
+            )
+
+            verdict = self.merge(top)
+
+            self.assert_passes(verdict, "a bundle module and its jar ref")
+            document = self.merged(top)
+            refs = [c["bom-ref"] for c in document["components"]]
+            self.assertEqual(sorted(refs), sorted([bundle, IMPL, GUAVA]))
+            edges = {
+                d["ref"]: d["dependsOn"] for d in document["dependencies"]
+            }
+            self.assertNotIn(jar, edges)
+            self.assertEqual(edges[IMPL], [bundle])
+            self.assertEqual(edges[bundle], [GUAVA])
+
+    def test_the_strongest_scope_wins(self) -> None:
+        """A library two modules scope differently keeps the stronger."""
+        cases = (
+            ("optional", "required", "required"),
+            ("required", "optional", "required"),
+            ("excluded", "optional", "optional"),
+            ("optional", None, None),
+        )
+        for first, second, expected in cases:
+            with (
+                self.subTest(first=first, second=second),
+                tempfile.TemporaryDirectory() as scratch,
+            ):
+                top = Path(scratch)
+                lib_a, lib_b = library(GUAVA), library(GUAVA)
+                lib_a["scope"] = first
+                if second is None:
+                    del lib_b["scope"]
+                else:
+                    lib_b["scope"] = second
+                place(top, "a", module_bom(API, [lib_a], {API: [GUAVA]}))
+                place(top, "b", module_bom(IMPL, [lib_b], {IMPL: [GUAVA]}))
+
+                verdict = self.merge(top)
+
+                self.assert_passes(verdict, f"{first} beside {second}")
+                scopes = {
+                    c["bom-ref"]: c.get("scope")
+                    for c in self.merged(top)["components"]
+                }
+                self.assertEqual(scopes[GUAVA], expected)
+
+    def test_skips_a_bom_the_repository_tracks(self) -> None:
+        """A committed target/bom.json is not the build's output."""
+        with tempfile.TemporaryDirectory() as scratch:
+            top = Path(scratch)
+            reactor(top)
+            place(top, "archived/old", module_bom(NETTY, [], {NETTY: []}))
+            subprocess.run(
+                ["git", "init", "-q", str(top)], check=True, timeout=30
+            )
+            subprocess.run(
+                ["git", "-C", str(top), "add", "archived/old"],
+                check=True,
+                timeout=30,
+            )
+
+            verdict = self.merge(top)
+
+            self.assert_passes(verdict, "a tracked BOM is skipped")
+            refs = [c["bom-ref"] for c in self.merged(top)["components"]]
+            self.assertEqual(sorted(refs), sorted([API, IMPL, GUAVA, NETTY]))
+            scoped = {
+                c["bom-ref"]: c.get("scope")
+                for c in self.merged(top)["components"]
+            }
+            self.assertEqual(scoped[NETTY], "required", "not a module")
+            self.assertIn("archived/old/target/bom.json", verdict.log)
+            self.assertNotIn("Merged archived", verdict.log)
+
     def test_ignores_boms_outside_the_modules(self) -> None:
         """A BOM in a target tree or beside no pom.xml is not a module."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -299,6 +393,16 @@ class SbomSourceWiring(ContractCase):
         upload = self.condition(UPLOAD_STEP)
         self.assertIn("steps.sbom.outcome == 'success'", upload)
         self.assertIn("steps.sbom-merge.outcome == 'success'", upload)
+
+    def test_the_merge_uploads_its_json_alone(self) -> None:
+        """Under 'build' no stale sbom-cyclonedx.xml joins the upload."""
+        build = job_of(load_workflow(MAVEN), "build")
+        path = text(section(step_of(build, UPLOAD_STEP), "with").get("path"))
+        self.assertEqual(
+            path,
+            "${{ inputs.sbom_source == 'build' && 'sbom-cyclonedx.json'"
+            " || 'sbom-cyclonedx.*' }}",
+        )
 
 
 if __name__ == "__main__":

@@ -94,12 +94,19 @@ that a parent binding `cyclonedx-maven-plugin`'s `makeBom` (as
 odlparent does) wrote into each module during the build, so the SBOM
 describes what the project publishes without a second resolution. The
 merge keeps one root, each module once and every module's dependency
-graph, so the Grype gate still tells direct from transitive. It needs
-a successful build, since a failed one may stop partway, and fails
-when no module wrote a BOM, a BOM omits its CycloneDX schema version,
-or the BOMs mix schema versions.
+graph, so the Grype gate still tells direct from transitive. A Maven
+purl names a module by its coordinates alone, since a `bundle` module
+names itself `?type=bundle` where its siblings name it `?type=jar`,
+and a library that modules scope differently keeps the strongest
+scope. It needs a successful build, since a failed one may stop
+partway, and fails when no module wrote a BOM, or a module's BOM is
+not a CycloneDX document, omits its schema version or names no
+`metadata.component.bom-ref`, or the BOMs mix schema versions.
 It reads every module in the workspace, so modules a reactor names
-beside `path_prefix` count, and skips any BOM inside a `target` tree.
+beside `path_prefix` count. It skips any BOM inside a `target` tree,
+and warns on and skips a `target/bom.json` the repository tracks,
+since the build did not write it. The upload under `build` takes
+`sbom-cyclonedx.json` alone, so no stale `sbom-cyclonedx.xml` joins it.
 The POM and environment guards below apply under either source.
 
 The per-step timeout inputs (`tests_timeout_minutes`,

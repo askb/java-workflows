@@ -1371,12 +1371,18 @@ jobs:
       # dependsOn, each module unscoped, each third-party component
       # once and scoped, and every module's edges. A module that a
       # sibling depends on is scoped in the sibling's BOM; its own
-      # unscoped entry wins, as in the aggregate. Only a successful
+      # unscoped entry wins, as in the aggregate. The sibling names it
+      # by the dependency's type ('?type=jar') where the module names
+      # itself by its packaging ('?type=bundle'), so a Maven purl
+      # names a module by its coordinates alone. A library that
+      # modules scope differently keeps the strongest scope, so the
+      # Grype gate errs towards it. Only a successful
       # build counts, since a failed one stops partway and a partial
       # reactor would pass for the whole. The walk covers the whole
       # workspace, not path_prefix alone, since a reactor may name
-      # modules beside it ('../core'); a fresh checkout holds no
-      # target/bom.json the build did not write. A target tree is
+      # modules beside it ('../core'). A target/bom.json the
+      # repository tracks is not the build's output, so the merge
+      # skips it with a warning. A target tree is
       # build output, never a module, and can hold other projects'
       # BOMs.
       - name: 'Merge the build SBOMs'
@@ -1392,9 +1398,13 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import subprocess
           import sys
           import uuid
           from datetime import datetime, timezone
+
+          # Absent, 'required' or unknown: 0, the strongest.
+          STRENGTH = {"optional": 1, "excluded": 2}
 
 
           def shown(value):
@@ -1409,15 +1419,47 @@ jobs:
               sys.exit(1)
 
 
+          def tracked(top):
+              try:
+                  listed = subprocess.run(
+                      ["git", "-C", top, "ls-files", "-z", "--",
+                       "*target/bom.json"],
+                      capture_output=True, check=True, timeout=120,
+                  ).stdout.decode("utf-8", "replace")
+              except (OSError, subprocess.SubprocessError):
+                  return set()
+              return {os.path.normpath(p) for p in listed.split("\0") if p}
+
+
           def module_boms(top):
               found = []
+              committed = tracked(top)
               for path, dirs, files in os.walk(top):
                   skipped = ("target", ".git")
                   dirs[:] = sorted(d for d in dirs if d not in skipped)
                   bom = os.path.join(path, "target", "bom.json")
                   if "pom.xml" in files and os.path.isfile(bom):
-                      found.append(os.path.normpath(bom))
+                      bom = os.path.normpath(bom)
+                      if bom in committed:
+                          print(
+                              f"::warning::Skipped {shown(bom)}: the"
+                              " repository tracks it, so the build did"
+                              " not write it."
+                          )
+                          continue
+                      found.append(bom)
               return found
+
+
+          def coordinates(ref):
+              """A Maven purl without its qualifiers names its module."""
+              if ref.startswith("pkg:maven/"):
+                  return ref.split("#", 1)[0].split("?", 1)[0]
+              return ref
+
+
+          def strength(component):
+              return STRENGTH.get(component.get("scope"), 0)
 
 
           def load(path):
@@ -1464,6 +1506,13 @@ jobs:
               module = dict(doc["metadata"]["component"])
               module.pop("scope", None)
               modules.setdefault(module["bom-ref"], module)
+          module_of = {coordinates(ref): ref for ref in modules}
+
+
+          def canonical(ref):
+              return module_of.get(coordinates(ref), ref)
+
+
           third_party = {}
           edges = {}
           for doc in docs:
@@ -1471,17 +1520,26 @@ jobs:
                   if not isinstance(component, dict):
                       continue
                   ref = component.get("bom-ref")
-                  key = ref if isinstance(ref, str) else json.dumps(component)
-                  if key not in modules:
-                      third_party.setdefault(key, component)
+                  if isinstance(ref, str):
+                      key = canonical(ref)
+                  else:
+                      key = json.dumps(component)
+                  if key in modules:
+                      continue
+                  kept = third_party.get(key)
+                  if kept is None or strength(component) < strength(kept):
+                      third_party[key] = component
               for entry in doc.get("dependencies") or []:
                   if not isinstance(entry, dict):
                       continue
                   if isinstance(entry.get("ref"), str):
-                      targets = edges.setdefault(entry["ref"], {})
+                      source = canonical(entry["ref"])
+                      targets = edges.setdefault(source, {})
                       for target in entry.get("dependsOn") or []:
                           if isinstance(target, str):
-                              targets[target] = None
+                              target = canonical(target)
+                              if target != source:
+                                  targets[target] = None
 
           # A purl cannot start 'reactor:', so the root names no module.
           repository = os.environ["REPOSITORY"] or "reactor"
@@ -1546,8 +1604,10 @@ jobs:
           # replaces the upload of an earlier attempt rather than adding
           # a second the compatibility check would read beside it.
           overwrite: ${{ inputs.artifact_suffix != '' }}
-          # Glob matches whichever SBOM formats the generator produced.
-          path: sbom-cyclonedx.*
+          # Glob matches whichever SBOM formats the generator produced;
+          # the merge writes JSON alone, so a stale XML stays behind.
+          # yamllint disable-line rule:line-length
+          path: ${{ inputs.sbom_source == 'build' && 'sbom-cyclonedx.json' || 'sbom-cyclonedx.*' }}
           retention-days: 45
           # The Grype job reads this artifact, so a missing or misnamed
           # SBOM must surface here rather than there.
