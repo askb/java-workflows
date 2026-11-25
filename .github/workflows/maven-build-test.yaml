@@ -1430,6 +1430,9 @@ jobs:
                   doc = {}
               if doc.get("bomFormat") != "CycloneDX":
                   fail(f"{shown(path)} is not a CycloneDX document.")
+              spec = doc.get("specVersion")
+              if not isinstance(spec, str) or not spec:
+                  fail(f"{shown(path)} does not name its specVersion.")
               metadata = doc.get("metadata")
               if not isinstance(metadata, dict):
                   metadata = {}
@@ -1449,7 +1452,7 @@ jobs:
                   " cyclonedx-maven-plugin makeBom in each module."
               )
           docs = [load(path) for path in paths]
-          specs = sorted({str(doc.get("specVersion")) for doc in docs})
+          specs = sorted({doc["specVersion"] for doc in docs})
           if len(specs) != 1:
               fail(
                   "The module BOMs mix CycloneDX schemas "

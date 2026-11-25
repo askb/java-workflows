@@ -227,6 +227,23 @@ class SbomMerge(ContractCase):
 
             self.assert_fails(verdict, "1.4 beside 1.6")
 
+    def test_fails_without_a_schema_version(self) -> None:
+        """A module BOM must name its specVersion as a string."""
+        for spec in (None, "", 1.6):
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as s:
+                top = Path(s)
+                bom = module_bom(API, [], {API: []})
+                if spec is None:
+                    del bom["specVersion"]
+                else:
+                    bom["specVersion"] = spec
+                place(top, "api", bom)
+
+                verdict = self.merge(top)
+
+                self.assert_fails(verdict, f"specVersion {spec!r}")
+                self.assertFalse((top / "sbom-cyclonedx.json").exists())
+
     def test_fails_on_a_document_that_is_not_cyclonedx(self) -> None:
         """A module's target/bom.json that is not CycloneDX fails."""
         with tempfile.TemporaryDirectory() as scratch:

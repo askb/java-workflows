@@ -96,7 +96,8 @@ describes what the project publishes without a second resolution. The
 merge keeps one root, each module once and every module's dependency
 graph, so the Grype gate still tells direct from transitive. It needs
 a successful build, since a failed one may stop partway, and fails
-when no module wrote a BOM or the BOMs mix CycloneDX schema versions.
+when no module wrote a BOM, a BOM omits its CycloneDX schema version,
+or the BOMs mix schema versions.
 It reads every module in the workspace, so modules a reactor names
 beside `path_prefix` count, and skips any BOM inside a `target` tree.
 The POM and environment guards below apply under either source.
