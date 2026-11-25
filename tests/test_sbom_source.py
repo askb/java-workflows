@@ -257,6 +257,74 @@ class SbomMerge(ContractCase):
             self.assertIn("archived/old/target/bom.json", verdict.log)
             self.assertNotIn("Merged archived", verdict.log)
 
+    def test_skips_a_bom_a_nested_repository_tracks(self) -> None:
+        """A BOM committed in a submodule is not the build's output."""
+        with tempfile.TemporaryDirectory() as scratch:
+            top = Path(scratch)
+            reactor(top)
+            place(top, "lib/old", module_bom(NETTY, [], {NETTY: []}))
+            for repo in (top, top / "lib"):
+                subprocess.run(
+                    ["git", "init", "-q", str(repo)], check=True, timeout=30
+                )
+            subprocess.run(
+                ["git", "-C", str(top / "lib"), "add", "old"],
+                check=True,
+                timeout=30,
+            )
+
+            verdict = self.merge(top)
+
+            self.assert_passes(verdict, "a submodule's tracked BOM")
+            self.assertIn("lib/old/target/bom.json", verdict.log)
+            self.assertNotIn("Merged lib", verdict.log)
+
+    def test_an_attached_artifact_is_its_module(self) -> None:
+        """A sibling's dependency on api's test-jar names api itself."""
+        with tempfile.TemporaryDirectory() as scratch:
+            top = Path(scratch)
+            tests = API.replace("?type=jar", "?classifier=tests&type=jar")
+            place(top, "api", module_bom(API, [library(GUAVA)], {}))
+            place(
+                top,
+                "impl",
+                module_bom(
+                    IMPL,
+                    [library(tests), library(GUAVA)],
+                    {IMPL: [tests], tests: [GUAVA], GUAVA: []},
+                ),
+            )
+
+            verdict = self.merge(top)
+
+            self.assert_passes(verdict, "a test-jar of a reactor module")
+            document = self.merged(top)
+            refs = [c["bom-ref"] for c in document["components"]]
+            self.assertEqual(sorted(refs), sorted([API, IMPL, GUAVA]))
+            edges = {
+                d["ref"]: d["dependsOn"] for d in document["dependencies"]
+            }
+            self.assertEqual(edges[IMPL], [API])
+            self.assertEqual(edges[API], [GUAVA])
+
+    def test_fails_on_a_module_without_a_name(self) -> None:
+        """A module BOM must name itself by a nonempty bom-ref."""
+        for ref in (None, "", 7):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as s:
+                top = Path(s)
+                bom = module_bom(API, [], {API: []})
+                component = bom["metadata"]["component"]
+                if ref is None:
+                    del component["bom-ref"]
+                else:
+                    component["bom-ref"] = ref
+                place(top, "api", bom)
+
+                verdict = self.merge(top)
+
+                self.assert_fails(verdict, f"bom-ref {ref!r}")
+                self.assertFalse((top / "sbom-cyclonedx.json").exists())
+
     def test_ignores_boms_outside_the_modules(self) -> None:
         """A BOM in a target tree or beside no pom.xml is not a module."""
         with tempfile.TemporaryDirectory() as scratch:

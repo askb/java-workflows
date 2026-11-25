@@ -1374,14 +1374,17 @@ jobs:
       # unscoped entry wins, as in the aggregate. The sibling names it
       # by the dependency's type ('?type=jar') where the module names
       # itself by its packaging ('?type=bundle'), so a Maven purl
-      # names a module by its coordinates alone. A library that
+      # names a module by its coordinates alone; an attached artifact
+      # ('?classifier=tests') counts as its module, which built it. A
+      # library that
       # modules scope differently keeps the strongest scope, so the
       # Grype gate errs towards it. Only a successful
       # build counts, since a failed one stops partway and a partial
       # reactor would pass for the whole. The walk covers the whole
       # workspace, not path_prefix alone, since a reactor may name
-      # modules beside it ('../core'). A target/bom.json the
-      # repository tracks is not the build's output, so the merge
+      # modules beside it ('../core'). A target/bom.json that the
+      # repository owning its module tracks (a submodule's, inside
+      # one) is not the build's output, so the merge
       # skips it with a warning. A target tree is
       # build output, never a module, and can hold other projects'
       # BOMs.
@@ -1419,28 +1422,28 @@ jobs:
               sys.exit(1)
 
 
-          def tracked(top):
+          def tracked(module):
+              """Whether the repository owning module tracks its BOM."""
               try:
                   listed = subprocess.run(
-                      ["git", "-C", top, "ls-files", "-z", "--",
-                       "*target/bom.json"],
-                      capture_output=True, check=True, timeout=120,
-                  ).stdout.decode("utf-8", "replace")
+                      ["git", "-C", module, "ls-files", "-z", "--",
+                       "target/bom.json"],
+                      capture_output=True, check=True, timeout=60,
+                  ).stdout
               except (OSError, subprocess.SubprocessError):
-                  return set()
-              return {os.path.normpath(p) for p in listed.split("\0") if p}
+                  return False
+              return bool(listed)
 
 
           def module_boms(top):
               found = []
-              committed = tracked(top)
               for path, dirs, files in os.walk(top):
                   skipped = ("target", ".git")
                   dirs[:] = sorted(d for d in dirs if d not in skipped)
                   bom = os.path.join(path, "target", "bom.json")
                   if "pom.xml" in files and os.path.isfile(bom):
                       bom = os.path.normpath(bom)
-                      if bom in committed:
+                      if tracked(path):
                           print(
                               f"::warning::Skipped {shown(bom)}: the"
                               " repository tracks it, so the build did"
@@ -1481,7 +1484,8 @@ jobs:
               root = metadata.get("component")
               if not isinstance(root, dict):
                   root = {}
-              if not isinstance(root.get("bom-ref"), str):
+              ref = root.get("bom-ref")
+              if not isinstance(ref, str) or not ref:
                   fail(f"{shown(path)} does not name its own module.")
               return doc
 
