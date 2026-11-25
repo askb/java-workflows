@@ -52,6 +52,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 
+from action_pins import BUILD_ARTIFACT_ACTION, GRYPE_ACTION
 from guards import needs_runner_tools, run_script
 from helpers import (
     BUDGET,
@@ -131,9 +132,6 @@ EXPAND_VENDORED = (
     ".github/scripts/vendor/maven-build-action/expand-workspace-vars.sh"
 )
 METADATA_ACTION = "lfreleng-actions/maven-snapshot-metadata-action"
-GRYPE_ACTION = "lfreleng-actions/grype-scan-action"
-BUILD_ARTIFACT_ACTION = "lfreleng-actions/build-artifact-action"
-BUILD_ARTIFACT_PIN = "da760dc32b7c902d9abde529e12f2557a3897e4f"
 ARTEFACT_ACTIONS = (
     "actions/upload-artifact",
     "actions/download-artifact",
@@ -1097,10 +1095,9 @@ class M2repoHandOff(ContractCase):
         """Fail unless build packs the landed m2repo and reports its ID."""
         build = job_of(merge, "build")
         pack = step_of(build, M2REPO_PACK)
-        self.assertEqual(
-            uses_of(pack),
-            f"{BUILD_ARTIFACT_ACTION}@{BUILD_ARTIFACT_PIN}",
-            f"{MERGE}: '{M2REPO_PACK}' does not run the pinned action",
+        self.assertTrue(
+            is_action(pack, BUILD_ARTIFACT_ACTION),
+            f"{MERGE}: '{M2REPO_PACK}' must run {BUILD_ARTIFACT_ACTION}",
         )
         locate = step_with_id(build, M2REPO_LOCATE_ID)
         self.assertIsNotNone(
@@ -1156,10 +1153,9 @@ class M2repoHandOff(ContractCase):
         """Fail unless publish unpacks by ID and digest where Nexus reads."""
         publish = job_of(merge, "publish")
         unpack = step_of(publish, M2REPO_UNPACK)
-        self.assertEqual(
-            uses_of(unpack),
-            f"{BUILD_ARTIFACT_ACTION}@{BUILD_ARTIFACT_PIN}",
-            f"{MERGE}: '{M2REPO_UNPACK}' does not run the pinned action",
+        self.assertTrue(
+            is_action(unpack, BUILD_ARTIFACT_ACTION),
+            f"{MERGE}: '{M2REPO_UNPACK}' must run {BUILD_ARTIFACT_ACTION}",
         )
         self.assertEqual(
             {key: text(value) for key, value in with_of(unpack).items()},
@@ -1213,10 +1209,9 @@ class M2repoHandOff(ContractCase):
     def check_merge_check(self, testing: Workflow) -> None:
         """Fail unless merge-check unpacks the call's m2repo by ID."""
         unpack = step_of(job_of(testing, "merge-check"), M2REPO_UNPACK)
-        self.assertEqual(
-            uses_of(unpack),
-            f"{BUILD_ARTIFACT_ACTION}@{BUILD_ARTIFACT_PIN}",
-            f"{TESTING}: '{M2REPO_UNPACK}' does not run the pinned action",
+        self.assertTrue(
+            is_action(unpack, BUILD_ARTIFACT_ACTION),
+            f"{TESTING}: '{M2REPO_UNPACK}' must run {BUILD_ARTIFACT_ACTION}",
         )
         self.assertEqual(
             {key: text(value) for key, value in with_of(unpack).items()},

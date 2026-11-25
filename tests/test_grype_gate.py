@@ -64,6 +64,7 @@ import unittest
 from typing import Any, ClassVar, cast
 from unittest import mock
 
+from action_pins import GRYPE_ACTION, action_uses, check_pins, check_repinned
 from guards import needs_runner_tools, run_script
 from helpers import (
     CHECKOUT_ACTIONS,
@@ -107,13 +108,6 @@ META_ACTION = "lfreleng-actions/repository-metadata-action"
 META_FLOOR = (0, 5, 4)
 # The files that call the action, each once, all at one pin.
 META_FILES = (*LANES, MERGE, TESTING)
-# A reference to the action: its ref, then the rest of the line.
-META_REFERENCE = re.compile(
-    rf"{re.escape(META_ACTION)}@(\S*)(.*)$", re.MULTILINE
-)
-FULL_SHA = re.compile(r"[0-9a-f]{40}")
-# The version comment a pin carries, as Dependabot writes it.
-VERSION_COMMENT = re.compile(r"  # v(\d+)\.(\d+)\.(\d+)")
 # The detector the lanes called before repository-metadata-action took
 # detection over; no workflow may call it, or read its sidecar, now.
 OLD_DETECTOR = "lfreleng-actions/dependency-change-action@"
@@ -123,12 +117,6 @@ OLD_WIRING = (
     "dependency-change-manifest",
 )
 OLD_JOB = "dependency-change"
-GRYPE_PIN = "f65dca2762823cfc8f376e32fee9baa6f3292696"
-GRYPE_ACTION = "lfreleng-actions/grype-scan-action"
-GRYPE_USES = f"{GRYPE_ACTION}@{GRYPE_PIN}"
-# The pin with its version comment, as each lane's text must hold it:
-# once on the validation step, once on the scan.
-GRYPE_LINE = f"uses: {GRYPE_USES}  # v0.6.2"
 
 VALIDATE_JOB = "gerrit-validate"
 MERGE_VALIDATE_JOB = "validate"
@@ -315,19 +303,13 @@ ECOSYSTEM_FAILS = (
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
-def meta_pins(source: str) -> list[tuple[str, str]]:
-    """Return the ref and rest of the line of each call to the action."""
-    return [(match[1], match[2]) for match in META_REFERENCE.finditer(source)]
-
-
 def lanes_meta_uses() -> str:
     """Return the uses: value at the lanes' repository-metadata pin.
 
     Read from the Maven lane; MetadataDetection holds every file that
     calls the action to that one pin.
     """
-    pins = meta_pins(read_text(MAVEN))
-    return f"{META_ACTION}@{pins[0][0]}" if pins else ""
+    return action_uses(META_ACTION, read_text(MAVEN))
 
 
 def mutated(workflow: Workflow) -> Workflow:
@@ -383,7 +365,7 @@ class GatePolicyInputs(ContractCase):
             )
 
     def check_scanner(self, workflow: Workflow) -> None:
-        """Fail unless the scanner is pinned and reads the SBOM in place."""
+        """Fail unless the step runs the scanner on the SBOM in place."""
         grype = step_of(job_of(workflow, "grype"), GRYPE_STEP)
         passed = with_of(grype)
         self.assertEqual(
@@ -391,10 +373,9 @@ class GatePolicyInputs(ContractCase):
             f"{SBOM_DIR}/sbom-cyclonedx.json",
             f"'{GRYPE_STEP}' must scan the SBOM from its download",
         )
-        self.assertEqual(
-            uses_of(grype),
-            GRYPE_USES,
-            f"'{GRYPE_STEP}' must run grype-scan-action at {GRYPE_PIN}",
+        self.assertTrue(
+            is_action(grype, GRYPE_ACTION),
+            f"'{GRYPE_STEP}' must run {GRYPE_ACTION}",
         )
 
     def test_inputs_reach_the_scanner(self) -> None:
@@ -403,8 +384,8 @@ class GatePolicyInputs(ContractCase):
             with self.subTest(lane=lane):
                 self.check_inputs(load_workflow(lane))
 
-    def test_the_scanner_is_pinned_and_reads_the_download(self) -> None:
-        """Each lane's scanner is at the shared pin over the SBOM."""
+    def test_the_scanner_reads_the_download(self) -> None:
+        """Each lane runs the scanner over the downloaded SBOM."""
         for lane in LANES:
             with self.subTest(lane=lane):
                 self.check_scanner(load_workflow(lane))
@@ -433,11 +414,11 @@ class GatePolicyInputs(ContractCase):
         )
         self.assert_check_fails(self.check_inputs, workflow)
 
-    def test_a_scanner_at_another_pin_fails(self) -> None:
-        """A scanner at another commit fails the check."""
+    def test_a_different_scanner_fails(self) -> None:
+        """A step running another action fails the wiring check."""
         workflow = mutated(load_workflow(GRADLE))
         step = step_of(job_of(workflow, "grype"), GRYPE_STEP)
-        step["uses"] = f"lfreleng-actions/grype-scan-action@{'0' * 40}"
+        step["uses"] = f"{GRYPE_ACTION}-other@{'0' * 40}"
         self.assert_check_fails(self.check_scanner, workflow)
 
     def test_an_sbom_read_from_elsewhere_fails(self) -> None:
@@ -477,9 +458,13 @@ def mirrored_inputs(scan: Step) -> dict[str, str]:
     }
 
 
-def uses_in(job: Job) -> list[str]:
-    """Return the ``uses:`` of each action step of ``job``, in order."""
-    return [uses_of(step) for step in steps_of(job) if uses_of(step)]
+def action_names_in(job: Job) -> list[str]:
+    """Return the names of the actions the job runs, in order."""
+    return [
+        uses.partition("@")[0]
+        for step in steps_of(job)
+        if (uses := uses_of(step))
+    ]
 
 
 def validate_job_of(workflow: Workflow, lane: str) -> Job:
@@ -523,10 +508,9 @@ class GateInputValidation(ContractCase):
             uses_of(scan),
             f"'{name}' and '{GRYPE_STEP}' must share one pin",
         )
-        self.assertEqual(
-            uses_of(validator),
-            GRYPE_USES,
-            f"'{name}' must run grype-scan-action at {GRYPE_PIN}",
+        self.assertTrue(
+            is_action(validator, GRYPE_ACTION),
+            f"'{name}' must run {GRYPE_ACTION}",
         )
         self.assertEqual(
             with_of(validator),
@@ -540,8 +524,8 @@ class GateInputValidation(ContractCase):
     ) -> None:
         """Fail unless the validator is the job's only action step."""
         self.assertEqual(
-            uses_in(validate_job_of(workflow, lane)),
-            [GRYPE_USES],
+            action_names_in(validate_job_of(workflow, lane)),
+            [GRYPE_ACTION],
             f"{VALIDATORS[lane][0]} must run no action but the validator:"
             " no checkout, no harden-runner",
         )
@@ -572,20 +556,6 @@ class GateInputValidation(ContractCase):
             section(step, "env"),
             {"ECOSYSTEMS": ECOSYSTEMS_INPUT},
             f"'{ECOSYSTEMS_VALIDATE}' must read grype_dependency_ecosystems",
-        )
-
-    def check_pin_text(self, content: str, path: str) -> None:
-        """Fail unless the pinned line appears twice, and no other ref."""
-        self.assertEqual(
-            content.count(GRYPE_LINE),
-            2,
-            f"{path}: the validation step and the scan must both run"
-            f" {GRYPE_LINE}",
-        )
-        self.assertEqual(
-            content.count(f"{GRYPE_ACTION}@"),
-            2,
-            f"{path}: grype-scan-action must appear at that pin alone",
         )
 
     def validate(self, lane: str, ecosystems: str) -> Verdict:
@@ -633,12 +603,6 @@ class GateInputValidation(ContractCase):
         for lane in LANES:
             with self.subTest(lane=lane):
                 self.check_ecosystems_step(load_workflow(lane))
-
-    def test_the_pin_appears_twice_with_its_comment(self) -> None:
-        """Each lane's text holds the pinned uses: line twice."""
-        for lane in VALIDATED_LANES:
-            with self.subTest(lane=lane):
-                self.check_pin_text(read_text(lane), lane)
 
     @needs_runner_tools
     def test_dependency_ecosystems(self) -> None:
@@ -834,22 +798,6 @@ class GateInputValidation(ContractCase):
         self.assert_check_fails(self.check_ecosystems_step, workflow)
         self.assert_check_fails(self.check_no_shell_validator, workflow, MAVEN)
 
-    def test_one_pinned_line_fails(self) -> None:
-        """A lane with the pin on the scan alone fails."""
-        for lane in (MAVEN, MERGE):
-            with self.subTest(lane=lane):
-                content = read_text(lane).replace(GRYPE_LINE, "", 1)
-                self.assert_check_fails(self.check_pin_text, content, lane)
-
-    def test_a_third_reference_fails(self) -> None:
-        """A lane with a third grype-scan-action reference fails."""
-        for lane in (GRADLE, MERGE):
-            with self.subTest(lane=lane):
-                content = (
-                    read_text(lane) + f"\n# uses: {GRYPE_ACTION}@{'0' * 40}\n"
-                )
-                self.assert_check_fails(self.check_pin_text, content, lane)
-
 
 class GateValidateCheck(ContractCase):
     """testing.yaml's validate-only rejection.
@@ -888,8 +836,8 @@ class GateValidateCheck(ContractCase):
     def check_job_fetches_one_action(self, testing: Workflow) -> None:
         """Fail unless the validator is the job's only action step."""
         self.assertEqual(
-            uses_in(job_of(testing, CHECK_JOB)),
-            [GRYPE_USES],
+            action_names_in(job_of(testing, CHECK_JOB)),
+            [GRYPE_ACTION],
             f"{CHECK_JOB} must run no action but the validator, as the"
             f" lanes' {VALIDATE_JOB} does: no checkout, no harden-runner",
         )
@@ -897,7 +845,9 @@ class GateValidateCheck(ContractCase):
     def check_validator(self, testing: Workflow, lane: str) -> None:
         """Fail unless the step passes the lane's defaults, as literals."""
         step = step_of(job_of(testing, CHECK_JOB), GATE_VALIDATE)
-        self.assertEqual(uses_of(step), GRYPE_USES, f"'{GATE_VALIDATE}' uses")
+        self.assertTrue(
+            is_action(step, GRYPE_ACTION), f"'{GATE_VALIDATE}' uses"
+        )
         self.assertIs(
             step.get("continue-on-error"),
             True,
@@ -1039,37 +989,12 @@ class MetadataDetection(ContractCase):
     """Detection in the repository-metadata job: pin, inputs and output."""
 
     def check_pins(self, paths: tuple[str, ...]) -> None:
-        """Fail unless the files call the action once each, at one pin.
-
-        The pin is a full commit SHA carrying a '# vX.Y.Z' comment that
-        names a release no older than META_FLOOR, the same in every file.
-        """
-        seen: set[tuple[str, str]] = set()
-        for path in paths:
-            pins = meta_pins(read_text(path))
-            self.assertEqual(
-                len(pins), 1, f"{path}: {META_ACTION} must be called once"
-            )
-            for ref, comment in pins:
-                call = f"{path}: {META_ACTION}@{ref}"
-                self.assertIsNotNone(
-                    FULL_SHA.fullmatch(ref),
-                    f"{call} is not pinned to a full commit SHA",
-                )
-                version = VERSION_COMMENT.fullmatch(comment)
-                if version is None:
-                    self.fail(f"{call} lacks its '  # vX.Y.Z' comment")
-                release = tuple(int(part) for part in version.groups())
-                self.assertGreaterEqual(
-                    release,
-                    META_FLOOR,
-                    f"{call} names{comment[3:]}, older than the floor",
-                )
-                seen.add((ref, comment))
-        self.assertEqual(
-            len(seen),
-            1,
-            f"every {META_ACTION} call must share one pin: {sorted(seen)}",
+        """Fail unless the files call the action once each, at one pin."""
+        check_pins(
+            META_ACTION,
+            {path: read_text(path) for path in paths},
+            META_FLOOR,
+            dict.fromkeys(paths, 1),
         )
 
     def check_repinned(self, pins: dict[str, str]) -> None:
@@ -1077,16 +1002,9 @@ class MetadataDetection(ContractCase):
 
         ``pins`` maps a file to the text that follows '@' in its call.
         """
-        ref, comment = meta_pins(read_text(MAVEN))[0]
-        current = f"@{ref}{comment}"
-        sources = {path: read_text(path) for path in META_FILES}
-        for path, pin in pins.items():
-            self.assertIn(current, sources[path], f"{path} lost its pin")
-            sources[path] = sources[path].replace(current, f"@{pin}")
-        with mock.patch(
-            f"{__name__}.read_text", side_effect=sources.__getitem__
-        ):
-            self.check_pins(META_FILES)
+        check_repinned(
+            META_ACTION, dict.fromkeys(META_FILES, 1), META_FLOOR, pins
+        )
 
     def check_step(self, workflow: Workflow, preset: str) -> None:
         """Fail unless the metadata step detects with the lane's inputs."""
@@ -1641,7 +1559,7 @@ class TuningInputs(ContractCase):
         # The merge lane reports, never gates.
         self.assertEqual(text(passed.get("permit-fail")), "true")
         self.assertIs(grype.get("continue-on-error"), True)
-        self.assertEqual(uses_of(step_of(grype, GRYPE_STEP)), GRYPE_USES)
+        self.assertTrue(is_action(step_of(grype, GRYPE_STEP), GRYPE_ACTION))
 
     def test_the_verify_inputs(self) -> None:
         """Each verify lane declares and passes its new inputs."""
@@ -2080,7 +1998,7 @@ class GateVerdictCases(ContractCase):
             "fail-on": "medium",
         }
         got = {field: text(passed.get(field)) for field in want}
-        self.assertEqual(uses_of(step), GRYPE_USES, f"'{GRYPE_STEP}' uses")
+        self.assertTrue(is_action(step, GRYPE_ACTION), f"'{GRYPE_STEP}' uses")
         self.assertEqual(got, want, f"{CASES_JOB}'s '{GRYPE_STEP}'")
 
     def check_fail_on_default(self, workflow: Workflow) -> None:
